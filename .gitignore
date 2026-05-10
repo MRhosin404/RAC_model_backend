@@ -1,0 +1,25 @@
+node_modules/
+.env
+*.log
+.DS_Store
+dist/
+
+# Dependencies (Massive folders Git shouldn't track)
+node_modules/
+
+# Environment Variables (SENSITIVE - keep private)
+.env
+.env.local
+.env.development.local
+
+# Build outputs (Automatically generated)
+dist/
+build/
+*.pyc  # For Python backends
+__pycache__/
+
+# Logs and system junk
+*.log
+.DS_Store
+Thumbs.db
+

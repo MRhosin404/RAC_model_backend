@@ -1,33 +1,49 @@
 // server.js  — AuraLink Global Backend Entry Point
 require('dotenv').config();
 
-const http             = require('http');
-const express          = require('express');
+const http = require('http');
+const express = require('express');
 const { WebSocketServer } = require('ws');
-const cors             = require('cors');
-const helmet           = require('helmet');
-const morgan           = require('morgan');
-const rateLimit        = require('express-rate-limit');
-const connectDB        = require('./config/db');
-const errorHandler     = require('./middleware/errorHandler');
+const cors = require('cors');
+const helmet = require('helmet');
+const morgan = require('morgan');
+const rateLimit = require('express-rate-limit');
+const connectDB = require('./config/db');
+const errorHandler = require('./middleware/errorHandler');
 const heartbeatService = require('./services/heartbeatService');
 
 // ── Routes ────────────────────────────────────────────────────
-const authRoutes  = require('./routes/auth');
-const unitRoutes  = require('./routes/units');
-const espRoutes   = require('./routes/esp');
+const authRoutes = require('./routes/auth');
+const unitRoutes = require('./routes/units');
+const espRoutes = require('./routes/esp');
 
 // ── Connect to MongoDB ────────────────────────────────────────
 connectDB();
 
 const app = express();
 
-// ── Security middleware ───────────────────────────────────────
-app.use(helmet());
+// ── CORS ──────────────────────────────────────────────────────
+const ALLOWED_ORIGINS = [
+  'http://localhost:3000',
+  'http://localhost:5173',
+  process.env.CLIENT_ORIGIN,
+].filter(Boolean);
+
 app.use(cors({
-  origin:      process.env.CLIENT_ORIGIN || 'http://localhost:3000',
+  origin: (origin, callback) => {
+    // allow requests with no origin (mobile apps, curl, Postman)
+    if (!origin) return callback(null, true);
+    // allow any vercel.app subdomain
+    if (origin.endsWith('.vercel.app')) return callback(null, true);
+    // allow explicitly listed origins
+    if (ALLOWED_ORIGINS.includes(origin)) return callback(null, true);
+    callback(new Error(`CORS: origin ${origin} not allowed`));
+  },
   credentials: true,
 }));
+
+// ── Security middleware ───────────────────────────────────────
+app.use(helmet());
 
 // ── Body parsers ──────────────────────────────────────────────
 app.use(express.json({ limit: '10kb' }));
@@ -39,32 +55,30 @@ if (process.env.NODE_ENV === 'development') {
 }
 
 // ── Rate limiting ─────────────────────────────────────────────
-// Stricter limit on auth routes to prevent brute-force
 const authLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
-  max:      20,
-  message:  { success: false, message: 'Too many requests, please try again later.' },
+  windowMs: 15 * 60 * 1000,
+  max: 20,
+  message: { success: false, message: 'Too many requests, please try again later.' },
 });
 
-// Looser limit for ESP polling (5 s interval × many devices)
 const espLimiter = rateLimit({
-  windowMs: 60 * 1000,   // 1 minute
-  max:      300,
-  message:  { success: false, message: 'ESP rate limit exceeded.' },
+  windowMs: 60 * 1000,
+  max: 300,
+  message: { success: false, message: 'ESP rate limit exceeded.' },
 });
 
 // ── API Routes ────────────────────────────────────────────────
-app.use('/api/auth',  authLimiter, authRoutes);
+app.use('/api/auth', authLimiter, authRoutes);
 app.use('/api/units', unitRoutes);
-app.use('/api/esp',   espLimiter,  espRoutes);
+app.use('/api/esp', espLimiter, espRoutes);
 
 // ── Health check ──────────────────────────────────────────────
 app.get('/health', (req, res) => {
   res.status(200).json({
-    success:   true,
-    service:   'AuraLink Global API',
+    success: true,
+    service: 'AuraLink Global API',
     timestamp: new Date().toISOString(),
-    uptime:    process.uptime(),
+    uptime: process.uptime(),
   });
 });
 
@@ -77,20 +91,15 @@ app.use((req, res) => {
 app.use(errorHandler);
 
 // ── HTTP Server ───────────────────────────────────────────────
-const PORT   = process.env.PORT || 5000;
+const PORT = process.env.PORT || 5000;
 const server = http.createServer(app);
 
-// ── WebSocket Server (shares the same HTTP port) ──────────────
-//
-// React dashboard connects to ws://localhost:5000
-// The server pushes real-time events (DEVICE_STATUS_CHANGED, STATE_UPDATED,
-// SENSOR_UPDATE, DEVICE_ONLINE, COMMANDS_EXECUTED) to all connected clients.
+// ── WebSocket Server ──────────────────────────────────────────
 const wss = new WebSocketServer({ server, path: '/ws' });
 
 wss.on('connection', (ws, req) => {
   console.log(`[WS] Client connected. Total: ${wss.clients.size}`);
 
-  // Keep-alive ping to prevent proxy timeouts
   const pingInterval = setInterval(() => {
     if (ws.readyState === ws.OPEN) ws.ping();
   }, 25_000);
@@ -102,11 +111,10 @@ wss.on('connection', (ws, req) => {
 
   ws.on('error', err => console.error('[WS] Error:', err.message));
 
-  // Send a welcome handshake
   ws.send(JSON.stringify({ type: 'CONNECTED', message: 'AuraLink Global WebSocket ready' }));
 });
 
-// ── Start HeartbeatService (needs wss to broadcast) ──────────
+// ── Start HeartbeatService ────────────────────────────────────
 heartbeatService.init(wss);
 
 // ── Listen ────────────────────────────────────────────────────
@@ -115,6 +123,7 @@ server.listen(PORT, () => {
   console.log(`   HTTP  → http://localhost:${PORT}`);
   console.log(`   WS    → ws://localhost:${PORT}/ws`);
   console.log(`   Health → http://localhost:${PORT}/health\n`);
+  console.log(`   Allowed origins: ${ALLOWED_ORIGINS.join(', ')}\n`);
 });
 
 // ── Graceful shutdown ─────────────────────────────────────────
@@ -127,7 +136,7 @@ const shutdown = (signal) => {
 };
 
 process.on('SIGTERM', () => shutdown('SIGTERM'));
-process.on('SIGINT',  () => shutdown('SIGINT'));
+process.on('SIGINT', () => shutdown('SIGINT'));
 process.on('unhandledRejection', (err) => {
   console.error('Unhandled rejection:', err);
   shutdown('unhandledRejection');

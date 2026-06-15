@@ -1,41 +1,36 @@
-// routes/esp.js  — All endpoints consumed by physical ESP8266 devices
+// routes/esp.js — ESP8266 endpoints
 //
-// Every request MUST include: x-device-api-key header
-// Optional:                   x-device-id header (ESP chip ID / MAC)
+// ✅ NO AUTH REQUIRED — ESP8266 accesses these routes directly
+//    No x-device-api-key needed. Just use the unitId.
 //
-// Typical ESP poll cycle (every 5 s):
-//   1. GET  /api/esp/state/:unitId        → fetch desired state + pending commands
-//   2. POST /api/esp/sensor/:unitId       → push DHT22 room temp/humidity
-//   3. POST /api/esp/heartbeat/:unitId    → record device is alive
-//   4. POST /api/esp/ack/:unitId          → mark commands as executed
+// Poll cycle (every 5s):
+//   GET  /api/esp/state/:unitId      → fetch desired state + commands
+//   POST /api/esp/heartbeat/:unitId  → prove device is alive
+//   POST /api/esp/sensor/:unitId     → push DHT22 data
+//   POST /api/esp/ack/:unitId        → confirm commands executed
+//   GET  /api/esp/units              → list all units (setup portal)
+//   POST /api/esp/link               → link device to unit
 
-const express    = require('express');
-const router     = express.Router();
-const ACUnit     = require('../models/ACUnit');
-const deviceAuth = require('../middleware/deviceAuth');
+const express = require('express');
+const router = express.Router();
+const ACUnit = require('../models/ACUnit');
 const { broadcast } = require('../services/heartbeatService');
 
-// All ESP routes require device auth
-router.use(deviceAuth);
-
 // ── GET /api/esp/units ────────────────────────────────────────
-// @desc    List ALL active units (used during device linking — ESP shows
-//          this list on its captive portal so the user can pick one)
-// @access  Device
+// List all active units for the setup portal (no auth needed)
 router.get('/units', async (req, res, next) => {
   try {
     const units = await ACUnit.find({ isActive: true })
-      .select('_id name location brand owner isOnline')
+      .select('_id name location brand owner isOnline deviceId')
       .populate('owner', 'name')
       .sort({ name: 1 });
 
-    // Return a lightweight payload optimised for ESP memory
     const payload = units.map(u => ({
-      id:       u._id,
-      name:     u.name,
+      id: u._id,
+      name: u.name,
       location: u.location || '',
-      owner:    u.owner?.name || '',
-      linked:   !!u.deviceId, // already linked to a physical device?
+      owner: u.owner?.name || '',
+      linked: !!u.deviceId,
     }));
 
     res.status(200).json({ success: true, count: payload.length, units: payload });
@@ -45,19 +40,21 @@ router.get('/units', async (req, res, next) => {
 });
 
 // ── POST /api/esp/link ────────────────────────────────────────
-// @desc    Link this physical device to a specific Unit_ID.
-//          ESP calls this after the user selects a unit on the captive portal.
-//          Saves deviceId into the unit document.
-// @access  Device
+// Link this device to a unit. Called from setup portal.
+// Body: { unitId: "..." }
+// Optional header: x-device-id (ESP chip ID)
 router.post('/link', async (req, res, next) => {
   try {
     const { unitId } = req.body;
-    const deviceId   = req.headers['x-device-id'];
 
-    if (!unitId)   return res.status(400).json({ success: false, message: 'unitId is required' });
-    if (!deviceId) return res.status(400).json({ success: false, message: 'x-device-id header is required' });
+    if (!unitId) {
+      return res.status(400).json({ success: false, message: 'unitId is required' });
+    }
 
-    // Ensure no other unit is already linked to this deviceId
+    // Use x-device-id header if sent, otherwise generate one from unitId
+    const deviceId = req.headers['x-device-id'] || ('esp-' + unitId.slice(-8));
+
+    // Unlink this deviceId from any other unit first
     await ACUnit.updateMany({ deviceId }, { $unset: { deviceId: '' } });
 
     const unit = await ACUnit.findByIdAndUpdate(
@@ -66,14 +63,17 @@ router.post('/link', async (req, res, next) => {
       { new: true, runValidators: false }
     ).select('_id name location desiredState');
 
-    if (!unit) return res.status(404).json({ success: false, message: 'Unit not found' });
+    if (!unit) {
+      return res.status(404).json({ success: false, message: 'Unit not found' });
+    }
 
     broadcast({ type: 'DEVICE_LINKED', unitId: unit._id.toString(), deviceId });
 
     res.status(200).json({
-      success:      true,
-      message:      `Device linked to unit: ${unit.name}`,
-      unitId:       unit._id,
+      success: true,
+      message: `Linked to: ${unit.name}`,
+      unitId: unit._id,
+      deviceId: deviceId,
       desiredState: unit.desiredState,
     });
   } catch (err) {
@@ -82,42 +82,36 @@ router.post('/link', async (req, res, next) => {
 });
 
 // ── GET /api/esp/state/:unitId ────────────────────────────────
-// @desc    Fetch desired state AND drain the pending command queue.
-//          This is the main poll endpoint. The ESP calls this every 5 s.
-//          Returns the full desired state + any pending commands.
-// @access  Device
+// Main poll endpoint — returns desired state + pending commands.
+// Only sends "pending" commands. Marks them "sent" after sending.
+// ⚠️  commandQueue is auto-cleared by the server if it grows > 5 items.
 router.get('/state/:unitId', async (req, res, next) => {
   try {
-    const unit = await ACUnit.findById(req.params.unitId).select(
-      'desiredState commandQueue isOnline'
-    );
+    const unit = await ACUnit.findById(req.params.unitId)
+      .select('desiredState commandQueue isOnline');
 
-    if (!unit) return res.status(404).json({ success: false, message: 'Unit not found' });
+    if (!unit) {
+      return res.status(404).json({ success: false, message: 'Unit not found' });
+    }
 
-    // Filter to pending commands only
+    // Only take pending commands
     const pendingCommands = unit.commandQueue.filter(c => c.status === 'pending');
 
-    // Mark them as 'sent' so a duplicate poll doesn't re-send the same command
-    // The ESP must ACK (POST /esp/ack) to mark them 'executed'
-    await ACUnit.updateOne(
-      { _id: unit._id },
-      {
-        $set: {
-          'commandQueue.$[elem].status': 'sent',
-        },
-      },
-      {
-        arrayFilters: [{ 'elem.status': 'pending' }],
-        timestamps:   false,
-      }
-    );
+    // Mark pending → sent (so next poll doesn't re-send the same ones)
+    if (pendingCommands.length > 0) {
+      await ACUnit.updateOne(
+        { _id: unit._id },
+        { $set: { 'commandQueue.$[elem].status': 'sent' } },
+        { arrayFilters: [{ 'elem.status': 'pending' }], timestamps: false }
+      );
+    }
 
     res.status(200).json({
-      success:      true,
+      success: true,
       desiredState: unit.desiredState,
-      commands:     pendingCommands.map(c => ({
-        id:    c._id,
-        type:  c.type,
+      commands: pendingCommands.map(c => ({
+        id: c._id,
+        type: c.type,
         value: c.value,
       })),
     });
@@ -127,9 +121,8 @@ router.get('/state/:unitId', async (req, res, next) => {
 });
 
 // ── POST /api/esp/sensor/:unitId ──────────────────────────────
-// @desc    Push latest DHT22 sensor reading (room temp + humidity)
-//          ESP calls this every poll cycle.
-// @access  Device
+// Push DHT22 sensor data. roomTemperature is required.
+// Body: { roomTemperature, roomHumidity }
 router.post('/sensor/:unitId', async (req, res, next) => {
   try {
     const { roomTemperature, roomHumidity } = req.body;
@@ -143,22 +136,23 @@ router.post('/sensor/:unitId', async (req, res, next) => {
       {
         $set: {
           sensorData: {
-            roomTemperature,
-            roomHumidity: roomHumidity ?? null,
-            recordedAt:   new Date(),
+            roomTemperature: parseFloat(roomTemperature),
+            roomHumidity: roomHumidity != null ? parseFloat(roomHumidity) : null,
+            recordedAt: new Date(),
           },
         },
       },
       { new: false, timestamps: false }
     );
 
-    if (!unit) return res.status(404).json({ success: false, message: 'Unit not found' });
+    if (!unit) {
+      return res.status(404).json({ success: false, message: 'Unit not found' });
+    }
 
-    // Broadcast sensor update to all React clients
     broadcast({
-      type:    'SENSOR_UPDATE',
-      unitId:  req.params.unitId,
-      payload: { roomTemperature, roomHumidity },
+      type: 'SENSOR_UPDATE',
+      unitId: req.params.unitId,
+      payload: { roomTemperature: parseFloat(roomTemperature), roomHumidity },
     });
 
     res.status(200).json({ success: true, message: 'Sensor data recorded' });
@@ -168,19 +162,18 @@ router.post('/sensor/:unitId', async (req, res, next) => {
 });
 
 // ── POST /api/esp/heartbeat/:unitId ──────────────────────────
-// @desc    Ping endpoint — ESP calls this every 30 s to prove it's alive.
-//          Updates lastHeartbeat + sets isOnline=true.
-//          HeartbeatService marks devices offline if this stops arriving.
-// @access  Device
+// ESP calls this every 30s. If missed for 45s → marked offline.
 router.post('/heartbeat/:unitId', async (req, res, next) => {
   try {
     const unit = await ACUnit.findById(req.params.unitId);
-    if (!unit) return res.status(404).json({ success: false, message: 'Unit not found' });
+
+    if (!unit) {
+      return res.status(404).json({ success: false, message: 'Unit not found' });
+    }
 
     const wasOffline = !unit.isOnline;
     await unit.recordHeartbeat();
 
-    // If device just came back online, broadcast recovery event
     if (wasOffline) {
       broadcast({ type: 'DEVICE_ONLINE', unitId: unit._id.toString() });
     }
@@ -192,38 +185,43 @@ router.post('/heartbeat/:unitId', async (req, res, next) => {
 });
 
 // ── POST /api/esp/ack/:unitId ─────────────────────────────────
-// @desc    ESP confirms it has executed the listed command IDs.
-//          Marks them as 'executed' in the queue and updates reportedState.
-// @access  Device
+// ESP confirms commands were executed.
+// Body: { executedCommandIds: ["id1","id2"...], reportedState: {...} }
 router.post('/ack/:unitId', async (req, res, next) => {
   try {
     const { executedCommandIds, reportedState } = req.body;
 
     if (!Array.isArray(executedCommandIds) || executedCommandIds.length === 0) {
-      return res.status(400).json({ success: false, message: 'executedCommandIds array is required' });
+      return res.status(400).json({ success: false, message: 'executedCommandIds array required' });
     }
 
-    const updatePayload = {
-      $set: {
-        'commandQueue.$[elem].status':     'executed',
-        'commandQueue.$[elem].executedAt': new Date(),
-      },
-    };
-
+    // Mark commands as executed
     await ACUnit.updateOne(
       { _id: req.params.unitId },
-      updatePayload,
-      { arrayFilters: [{ 'elem._id': { $in: executedCommandIds } }], timestamps: false }
+      {
+        $set: {
+          'commandQueue.$[elem].status': 'executed',
+          'commandQueue.$[elem].executedAt': new Date(),
+        },
+      },
+      {
+        arrayFilters: [{ 'elem._id': { $in: executedCommandIds } }],
+        timestamps: false,
+      }
     );
 
-    // Optionally sync reported state
-    if (reportedState) {
-      await ACUnit.findByIdAndUpdate(req.params.unitId, { $set: { reportedState } });
+    // Sync reported state back if ESP sent it
+    if (reportedState && typeof reportedState === 'object') {
+      await ACUnit.findByIdAndUpdate(
+        req.params.unitId,
+        { $set: { reportedState } },
+        { timestamps: false }
+      );
     }
 
     broadcast({
-      type:    'COMMANDS_EXECUTED',
-      unitId:  req.params.unitId,
+      type: 'COMMANDS_EXECUTED',
+      unitId: req.params.unitId,
       payload: { executedCommandIds, reportedState },
     });
 

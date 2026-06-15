@@ -22,25 +22,7 @@ connectDB();
 
 const app = express();
 
-// ── CORS ──────────────────────────────────────────────────────
-const ALLOWED_ORIGINS = [
-  'http://localhost:3000',
-  'http://localhost:5173',
-  process.env.CLIENT_ORIGIN,
-].filter(Boolean);
-
-app.use(cors({
-  origin: (origin, callback) => {
-    // allow requests with no origin (mobile apps, curl, Postman)
-    if (!origin) return callback(null, true);
-    // allow any vercel.app subdomain
-    if (origin.endsWith('.vercel.app')) return callback(null, true);
-    // allow explicitly listed origins
-    if (ALLOWED_ORIGINS.includes(origin)) return callback(null, true);
-    callback(new Error(`CORS: origin ${origin} not allowed`));
-  },
-  credentials: true,
-}));
+app.use(cors());
 
 // ── Security middleware ───────────────────────────────────────
 app.use(helmet());
@@ -123,7 +105,6 @@ server.listen(PORT, () => {
   console.log(`   HTTP  → http://localhost:${PORT}`);
   console.log(`   WS    → ws://localhost:${PORT}/ws`);
   console.log(`   Health → http://localhost:${PORT}/health\n`);
-  console.log(`   Allowed origins: ${ALLOWED_ORIGINS.join(', ')}\n`);
 });
 
 // ── Graceful shutdown ─────────────────────────────────────────

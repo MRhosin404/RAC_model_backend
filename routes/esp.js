@@ -21,19 +21,10 @@ const { broadcast } = require('../services/heartbeatService');
 router.get('/units', async (req, res, next) => {
   try {
     const units = await ACUnit.find({ isActive: true })
-      .select('_id name location brand owner isOnline deviceId')
       .populate('owner', 'name')
       .sort({ name: 1 });
 
-    const payload = units.map(u => ({
-      id: u._id,
-      name: u.name,
-      location: u.location || '',
-      owner: u.owner?.name || '',
-      linked: !!u.deviceId,
-    }));
-
-    res.status(200).json({ success: true, count: payload.length, units: payload });
+    res.status(200).json(units);
   } catch (err) {
     next(err);
   }
